@@ -26,7 +26,7 @@ pub const Options = struct {
 
     // Used later:
     threads: usize = 1,
-    chunk_blocks: usize = 4096,
+    chunk_blocks: usize = 4096, // Each chunk will contain this many blocks of 16 values each (except the last one that might be smaller). This is used for parallelization and memory management.
 };
 
 pub fn dequantizeFile(
@@ -40,7 +40,7 @@ pub fn dequantizeFile(
     var file = try std.Io.Dir.cwd().openFile(io, input_path, .{ .mode = .read_only });
     defer file.close(io);
     var buffer: [1024]u8 = undefined;
-    var file_r: std.Io.File.Reader = file.reader(&buffer);
+    var file_r: std.Io.File.Reader = file.reader(io, &buffer);
 
     // 2. Parse input header
     var header = try st.Header.parse(allocator, &file_r.interface);
@@ -66,11 +66,17 @@ pub fn dequantizeFile(
     const writer: *std.Io.Writer = &output_file_writer.interface;
 
     // 6. Create new header for output file
-    var output_header = try st.Header.fromInfos(allocator, plan.tensors);
+    const output_infos = try allocator.alloc(st.TensorInfo, plan.tensors.len);
+    defer allocator.free(output_infos);
+
+    for (plan.tensors, 0..) |tensor, i| {
+        output_infos[i] = tensor.info;
+    } // Needed because the plan.tensors array contains OutputTensor objects (not accessible by safetensors.zig's Header)
+    var output_header = try st.Header.fromInfos(allocator, output_infos);
     defer output_header.deinit();
 
     // 7. Write output SafeTensors header
-    try output_header.write(writer);
+    try output_header.write(allocator, writer);
 
     // 8. Execute ConversionPlan
     plan.executePlan(&file_r, writer) catch |err| {
@@ -79,7 +85,6 @@ pub fn dequantizeFile(
     };
 
     // 9. Flush output Writer
-    try output_file.flush();
     try writer.flush();
 }
 
@@ -88,6 +93,9 @@ const OutputTensor = struct {
 
     info: st.TensorInfo, // Output metadata.
     source: Source, // How to generate the data using the input.
+
+    // Only non-null when this plan had to create a new shape.
+    owned_shape: ?[]usize = null,
 };
 
 const Nvfp4Source = struct {
@@ -109,6 +117,11 @@ const ConversionPlan = struct {
     input_header: *const st.Header,
 
     pub fn deinit(self: *ConversionPlan) void {
+        for (self.tensors) |tensor| {
+            if (tensor.owned_shape) |shape| {
+                self.allocator.free(shape);
+            }
+        }
         self.allocator.free(self.tensors);
     }
 
@@ -127,7 +140,7 @@ const ConversionPlan = struct {
             .input_header = header,
         };
         var count: usize = 0;
-        var byte_cursor = 0;
+        var byte_cursor: u64 = 0;
         for (header.tensors) |*tensor| {
             // Calculate the output tensor's begin and end offsets based on the input tensor's shape and the output type's size
 
@@ -135,26 +148,38 @@ const ConversionPlan = struct {
                 // Skip scale tensors, they are not included in the output
                 continue;
             }
-            //const num_elements = std.math.prod(tensor.shape);
-            // const output_element_size = tensor.byteSize(); //output_type.toDType().size(); // Check this!
-            // const output_byte_size = num_elements * output_element_size;
-            const logical_values = tensor.byteSize() * 2;
-
-            const output_byte_size = logical_values * @sizeOf(f16); // Not sure if I should hardcode f16 here. Check
-            const output_begin = byte_cursor;
-            const output_end = output_begin + output_byte_size;
-            byte_cursor = output_end;
 
             if (try matchNvfp4Weight(allocator, header, tensor)) |nvfp4_source| {
                 // Create dequantized output tensor entry in the plan
-                plan.tensors[count] = OutputTensor{ .info = .{ .name = tensor.name, .dtype = output_type.toDType(), .shape = tensor.shape, .begin = output_begin, .end = output_end }, .source = Source{ .nvfp4 = .{
+
+                if (tensor.shape.len == 0) return error.InvalidNvfp4Shape;
+
+                const output_shape = try allocator.dupe(usize, tensor.shape);
+                output_shape[output_shape.len - 1] *= 2; // Each byte contains 2 values, so we double the last dimension of the shape
+
+                const logical_values = tensor.byteSize() * 2;
+                const output_byte_size = logical_values * @as(u64, @intCast(output_type.toDType().size()));
+                const output_begin = byte_cursor;
+                const output_end = output_begin + output_byte_size;
+                byte_cursor = output_end;
+                plan.tensors[count] = OutputTensor{ .info = .{
+                    .name = tensor.name,
+                    .dtype = output_type.toDType(),
+                    .shape = output_shape,
+                    .begin = output_begin,
+                    .end = output_end,
+                }, .source = Source{ .nvfp4 = .{
                     .weight = tensor,
                     .block_scale = nvfp4_source.block_scale,
                     .global_scale = nvfp4_source.global_scale,
-                } } };
+                } }, .owned_shape = output_shape };
                 count += 1;
             } else {
                 // For other tensors (like biases), we will just copy them to the output
+                const output_byte_size = tensor.byteSize();
+                const output_begin = byte_cursor;
+                const output_end = output_begin + output_byte_size;
+                byte_cursor = output_end;
                 plan.tensors[count] = OutputTensor{
                     .info = .{ .name = tensor.name, .dtype = tensor.dtype, .shape = tensor.shape, .begin = output_begin, .end = output_end },
                     .source = Source{ .copy = tensor },
@@ -185,46 +210,100 @@ const ConversionPlan = struct {
     }
 };
 
-fn convertQuantizedWeightF16(allocator: std.mem.Allocator, source: *Nvfp4Source, reader: *std.Io.File.Reader, writer: *std.Io.Writer, input_data_start: u64) !void {
+const ChunkScratch = struct {
+    packed_bytes: []u8,
+    scales: []u8,
+    output: []f16,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        chunk_blocks: usize,
+    ) !ChunkScratch {
+        // Allocates scratch space for a chunk of blocks to be processed in parallel and returns a ChunkScratch object containing the allocated buffers.
+        return .{
+            .packed_bytes = try allocator.alloc(
+                u8,
+                chunk_blocks *
+                    nvfp4.packed_block_size,
+            ),
+
+            .scales = try allocator.alloc(
+                u8,
+                chunk_blocks,
+            ),
+
+            .output = try allocator.alloc(
+                f16,
+                chunk_blocks *
+                    nvfp4.block_size,
+            ),
+        };
+    }
+
+    pub fn deinit(
+        self: *ChunkScratch,
+        allocator: std.mem.Allocator,
+    ) void {
+        allocator.free(self.output);
+        allocator.free(self.scales);
+        allocator.free(self.packed_bytes);
+    }
+};
+
+const ChunkJob = struct {
+    // Represents a job for processing a chunk of blocks in parallel. It contains the necessary information to read the packed bytes and scales from the input file, dequantize them, and write the dequantized values to the output writer.
+    sequence: usize, //TODO: add description of this field
+
+    weight_offset: u64,
+    scale_offset: u64,
+    output_offset: u64,
+
+    block_count: usize, //TODO: add description of this field
+};
+
+fn convertQuantizedWeightF16(allocator: std.mem.Allocator, source: Nvfp4Source, reader: *std.Io.File.Reader, writer: *std.Io.Writer, input_data_start: u64) !void {
     // Dequantizes a quantized weight tensor from the input file and writes the dequantized values to the output file.
-    const num_bytes = source.weight.info.byteSize();
+    const num_bytes = source.weight.byteSize();
+    if (num_bytes % nvfp4.packed_block_size != 0) return error.InvalidNvfp4WeightSize;
+    const num_blocks = num_bytes / nvfp4.packed_block_size;
+    if (source.block_scale.byteSize() != num_blocks) return error.InvalidBlockScaleCount; // Maybe move these validations to a plan/validation step inside ChunkScratch
     const buffer = try allocator.alloc(u8, @intCast(num_bytes));
     defer allocator.free(buffer);
-    reader.seekTo(source.weight.info.begin + input_data_start);
-    try reader.readAll(&buffer);
+    try reader.seekTo(source.weight.begin + input_data_start);
+    try reader.interface.readSliceAll(buffer);
     // Find the scale and scale2 tensors
     const block_scale_tensor = source.block_scale;
     const global_scale_tensor = source.global_scale;
     const block_scale_bytes = try allocator.alloc(u8, block_scale_tensor.byteSize());
     defer allocator.free(block_scale_bytes);
-    reader.seekTo(block_scale_tensor.begin + input_data_start);
-    try reader.readAll(&block_scale_bytes);
+    try reader.seekTo(block_scale_tensor.begin + input_data_start);
+    try reader.interface.readSliceAll(block_scale_bytes);
 
     if (global_scale_tensor.byteSize() != 4)
         return error.InvalidGlobalScale;
 
     var global_scale_bytes: [4]u8 = undefined;
-    reader.seekTo(global_scale_tensor.begin + input_data_start);
-    try reader.readAll(&global_scale_bytes);
+    try reader.seekTo(global_scale_tensor.begin + input_data_start);
+    try reader.interface.readSliceAll(&global_scale_bytes);
 
     // Dequantize the weight tensor using the global scale and block scale tensors
     const global_scale_bits = std.mem.readInt(u32, &global_scale_bytes, .little);
     const global_scale: f32 = @bitCast(global_scale_bits);
     const num_values = num_bytes * 2; // Each byte contains 2 values
-    const weights_reader = std.Io.Reader.fromSlice(&buffer);
-    const scales_reader = std.Io.Reader.fromSlice(&block_scale_bytes);
+    var weights_reader = std.Io.Reader.fixed(buffer);
+    var scales_reader = std.Io.Reader.fixed(block_scale_bytes);
     try nvfp4.dequantizeStreamF16(&weights_reader, &scales_reader, global_scale, writer, num_values);
 }
 
 fn copyTensor(allocator: std.mem.Allocator, source: *const st.TensorInfo, reader: *std.Io.File.Reader, writer: *std.Io.Writer, input_data_start: u64) !void {
     // Copies the bytes of an input tensor to the output file. This is used for tensors that do not require dequantization, such as biases.
 
-    const num_bytes = source.info.byteSize();
+    const num_bytes = source.byteSize();
     const buffer = try allocator.alloc(u8, @intCast(num_bytes));
     defer allocator.free(buffer);
-    reader.seekTo(source.info.begin + input_data_start);
-    try reader.readAll(&buffer);
-    try writer.writeAll(&buffer);
+    try reader.seekTo(source.begin + input_data_start);
+    try reader.interface.readSliceAll(buffer);
+    try writer.writeAll(buffer);
 }
 
 fn countOutputTensors(header: *const st.Header) usize {

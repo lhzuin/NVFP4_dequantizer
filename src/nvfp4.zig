@@ -65,6 +65,33 @@ pub fn dequantizeBlockF16(
     }
 }
 
+pub fn dequantizeBlocksF16(
+    packed_bytes: []const u8,
+    scales: []const u8,
+    global_scale: f32,
+    output: []f16,
+) !void {
+    // Dequantizes a stream of blocks by reading the packed bytes and scales, and writing the dequantized values to the output slice.
+    if (packed_bytes.len % packed_block_size != 0) {
+        return error.InvalidPackedLength;
+    }
+    const num_blocks = packed_bytes.len / packed_block_size;
+    if (scales.len != num_blocks) {
+        return error.ScaleCountMismatch;
+    }
+    if (output.len != num_blocks * block_size) {
+        return error.OutputLengthMismatch;
+    }
+
+    for (0..num_blocks) |block_index| {
+        const packed_block = packed_bytes[block_index * packed_block_size .. (block_index + 1) * packed_block_size];
+        const block_scale_bits = scales[block_index];
+        var dequantized_block: [16]f16 = undefined;
+        dequantizeBlockF16(&packed_block, block_scale_bits, global_scale, &dequantized_block);
+        std.mem.copy(f16, output[block_index * block_size .. (block_index + 1) * block_size], dequantized_block);
+    }
+}
+
 pub fn dequantizeStreamF16(
     weights: *std.Io.Reader,
     scales: *std.Io.Reader,

@@ -11,7 +11,7 @@ pub const DType = enum {
     f8_e4m3,
     f16,
     f32,
-    //TODO: add bf16
+    bf16,
 
     pub fn size(self: DType) usize {
         return switch (self) {
@@ -19,6 +19,7 @@ pub const DType = enum {
             .f8_e4m3 => 1,
             .f16 => 2,
             .f32 => 4,
+            .bf16 => 2,
         };
     }
 
@@ -28,6 +29,7 @@ pub const DType = enum {
             .f8_e4m3 => "F8_E4M3",
             .f16 => "F16",
             .f32 => "F32",
+            .bf16 => "BF16",
         };
     }
 };
@@ -41,6 +43,48 @@ pub const TensorInfo = struct {
 
     pub fn byteSize(self: TensorInfo) u64 {
         return self.end - self.begin;
+    }
+};
+
+const HeaderJson = struct {
+    tensors: []const TensorInfo,
+
+    pub fn jsonStringify(
+        self: HeaderJson,
+        json: anytype,
+    ) !void {
+        try json.beginObject();
+
+        for (self.tensors) |tensor| {
+            try json.objectField(
+                tensor.name,
+            );
+
+            try json.beginObject();
+
+            try json.objectField("dtype");
+            try json.write(
+                tensor.dtype.toString(),
+            );
+
+            try json.objectField("shape");
+            try json.write(tensor.shape);
+
+            try json.objectField(
+                "data_offsets",
+            );
+
+            const offsets = [_]u64{
+                tensor.begin,
+                tensor.end,
+            };
+
+            try json.write(offsets);
+
+            try json.endObject();
+        }
+
+        try json.endObject();
     }
 };
 
@@ -65,14 +109,16 @@ pub const Header = struct {
 
         // Read u64 header length
         var header_length_bytes: [8]u8 = undefined;
-        try reader.readAll(&header_length_bytes);
+        try reader.readSliceAll(&header_length_bytes);
         const header_length = std.mem.readInt(u64, &header_length_bytes, .little);
 
         // Read JSON
         const header_end = Header.header_begin + header_length;
-        const header_bytes: []u8 = try a.alloc(u8, header_length);
-        defer a.free(header_bytes);
-        try reader.readAll(header_bytes);
+        const header_length_usize = std.math.cast(usize, header_length) orelse return error.HeaderTooLarge;
+
+        const header_bytes = try a.alloc(u8, header_length_usize);
+
+        try reader.readSliceAll(header_bytes);
 
         // Parse JSON
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, header_bytes, .{});
@@ -81,9 +127,11 @@ pub const Header = struct {
         // Count tensor entries
         var count: usize = 0;
 
-        for (parsed.Object().entries()) |entry| {
+        const object = parsed.value.object;
+
+        for (object.keys()) |key| {
             // Ignore metadata entries
-            if (std.mem.eql(u8, entry.key, "__metadata__")) continue;
+            if (std.mem.eql(u8, key, "__metadata__")) continue;
 
             count += 1;
         }
@@ -92,20 +140,23 @@ pub const Header = struct {
         var tensors: []TensorInfo = try a.alloc(TensorInfo, count);
 
         var index: usize = 0;
-        for (parsed.Object().entries()) |entry| {
+
+        for (object.keys()) |key| {
             // Ignore metadata entries
-            if (std.mem.eql(u8, entry.key, "__metadata__")) continue;
-            const name = try a.dupe(u8, entry.key);
-            const tensor_json = entry.value;
-            const dtype_str = try tensor_json.Object().get("dtype").String();
+            if (std.mem.eql(u8, key, "__metadata__")) continue;
+            const name = try a.dupe(u8, key);
+            const tensor_json = object.get(key).?;
+            const dtype_str = tensor_json.object.get("dtype").?.string;
             const dtype = try parseDType(dtype_str);
-            const shape_json = try tensor_json.Object().get("shape");
-            var shape: []usize = try a.alloc(usize, shape_json.Array().len());
-            for (shape_json.Array(), 0..) |dim, j| {
-                shape[j] = dim.Int();
+
+            const shape_json = tensor_json.object.get("shape").?;
+            var shape: []usize = try a.alloc(usize, shape_json.array.items.len);
+            for (shape_json.array.items, 0..) |dim, j| {
+                shape[j] = @intCast(dim.integer);
             }
-            const begin = try tensor_json.Object().get("data_offsets").Array()[0].Int();
-            const end = try tensor_json.Object().get("data_offsets").Array()[1].Int();
+            const data_offsets = tensor_json.object.get("data_offsets").?;
+            const begin: u64 = @intCast(data_offsets.array.items[0].integer);
+            const end: u64 = @intCast(data_offsets.array.items[1].integer);
             tensors[index] = TensorInfo{
                 .name = name,
                 .dtype = dtype,
@@ -160,40 +211,25 @@ pub const Header = struct {
         };
     }
 
-    pub fn write(self: *const Header, writer: *std.Io.Writer) !void {
+    pub fn write(self: *const Header, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
         // Writes the header to the given writer in .safetensors format
-        var json_obj = std.json.Object.init(self.arena.allocator());
-        defer json_obj.deinit();
 
-        // We should probably leave a placeholder and at the end of the writing process, go back and write the actual header length (using Header.header_begin maybe).
+        const json_bytes =
+            try std.json.Stringify.valueAlloc(
+                allocator,
+                HeaderJson{
+                    .tensors = self.tensors,
+                },
+                .{},
+            );
+        defer allocator.free(json_bytes);
 
-        for (self.tensors) |tensor| {
-            var tensor_obj = std.json.Object.init(self.arena.allocator());
-            defer tensor_obj.deinit();
+        var header_length_bytes: [Header.header_begin]u8 = undefined; // used for storing the length of the header in bytes
 
-            try tensor_obj.put("dtype", std.json.Value.fromString(tensor.dtype.toString()));
-            var shape_array = std.json.Array.init(self.arena.allocator());
-            defer shape_array.deinit();
-            for (tensor.shape) |dim| {
-                try shape_array.append(std.json.Value.fromInt(dim));
-            }
-            try tensor_obj.put("shape", std.json.Value.fromArray(&shape_array));
-            var offsets_array = std.json.Array.init(self.arena.allocator());
-            defer offsets_array.deinit();
-            try offsets_array.append(std.json.Value.fromInt(tensor.begin));
-            try offsets_array.append(std.json.Value.fromInt(tensor.end));
-            try tensor_obj.put("data_offsets", std.json.Value.fromArray(&offsets_array));
-
-            try json_obj.put(tensor.name, std.json.Value.fromObject(&tensor_obj));
-        }
-
-        const json_str = try json_obj.toString();
-        const json_bytes = json_str.?; // Check this syntax
-        const header_length: u64 = @intCast(json_bytes.len);
-        var header_length_bytes: [Header.header_begin]u8 = undefined;
-        std.mem.writeInt(u64, &header_length_bytes, header_length, .little);
+        std.mem.writeInt(u64, &header_length_bytes, @intCast(json_bytes.len), .little);
 
         try writer.writeAll(&header_length_bytes);
+
         try writer.writeAll(json_bytes);
     }
 
@@ -214,6 +250,9 @@ fn parseDType(name: []const u8) !DType {
 
     if (std.mem.eql(u8, name, "F32"))
         return .f32;
+
+    if (std.mem.eql(u8, name, "BF16"))
+        return .bf16;
 
     return error.UnsupportedDType;
 }
