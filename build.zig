@@ -56,6 +56,38 @@ pub fn build(b: *std.Build) void {
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
-    const test_step = b.step("test", "Run Zig unit tests");
-    test_step.dependOn(&run_unit_tests.step);
+    const convert_tests_module = b.createModule(.{
+        .root_source_file = b.path("tests/convert_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    convert_tests_module.addAnonymousImport("convert", .{
+        .root_source_file = b.path("src/convert.zig"),
+    });
+
+    const convert_tests = b.addTest(.{
+        .root_module = convert_tests_module,
+    });
+
+    const run_convert_tests = b.addRunArtifact(convert_tests);
+
+    const unit_test_step = b.step("test-unit", "Run Zig unit and converter tests");
+    unit_test_step.dependOn(&run_unit_tests.step);
+    unit_test_step.dependOn(&run_convert_tests.step);
+
+    const integration_tests = b.addSystemCommand(&.{
+        "python3",
+        "tests/test_integration.py",
+    });
+    integration_tests.setCwd(b.path("."));
+    integration_tests.setEnvironmentVariable("NVFP4_SKIP_BUILD", "1");
+    integration_tests.step.dependOn(b.getInstallStep());
+
+    const integration_test_step = b.step("test-integration", "Run CLI integration tests");
+    integration_test_step.dependOn(&integration_tests.step);
+
+    const test_step = b.step("test", "Run all tests");
+    test_step.dependOn(unit_test_step);
+    test_step.dependOn(integration_test_step);
 }

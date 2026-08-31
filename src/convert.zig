@@ -199,7 +199,8 @@ const ConversionPlan = struct {
         for (self.tensors) |tensor| {
             switch (tensor.source) {
                 .copy => |source| {
-                    try copyTensor(self.allocator, source, file_r, writer, self.input_header.data_start);
+                    //try copyTensor(self.allocator, source, file_r, writer, self.input_header.data_start);
+                    try copyTensor(source, file_r, writer, self.input_header.data_start);
                 },
 
                 .nvfp4 => |source| {
@@ -344,7 +345,7 @@ fn convertQuantizedWeightF16(allocator: std.mem.Allocator, source: Nvfp4Source, 
     // try nvfp4.dequantizeStreamF16(&weights_reader, &scales_reader, global_scale, writer, num_values);
 }
 
-fn copyTensor(allocator: std.mem.Allocator, source: *const st.TensorInfo, reader: *std.Io.File.Reader, writer: *std.Io.Writer, input_data_start: u64) !void {
+fn copyTensorOld(allocator: std.mem.Allocator, source: *const st.TensorInfo, reader: *std.Io.File.Reader, writer: *std.Io.Writer, input_data_start: u64) !void {
     // Copies the bytes of an input tensor to the output file. This is used for tensors that do not require dequantization, such as biases.
 
     const num_bytes = source.byteSize();
@@ -353,6 +354,13 @@ fn copyTensor(allocator: std.mem.Allocator, source: *const st.TensorInfo, reader
     try reader.seekTo(source.begin + input_data_start);
     try reader.interface.readSliceAll(buffer);
     try writer.writeAll(buffer);
+}
+
+fn copyTensor(source: *const st.TensorInfo, reader: *std.Io.File.Reader, writer: *std.Io.Writer, input_data_start: u64) !void {
+    // Copies the bytes of an input tensor to the output file. This is used for tensors that do not require dequantization, such as biases.
+    // This version uses streamExact64 to avoid allocating a buffer for the entire tensor, which is more efficient for large tensors.
+    try reader.seekTo(source.begin + input_data_start);
+    try reader.interface.streamExact64(writer, source.byteSize());
 }
 
 fn countOutputTensors(header: *const st.Header) usize {

@@ -7,6 +7,11 @@ const std = @import("std");
 pub const block_size = 16; // Number of quantized FP4 values in a single block (8 bytes)
 pub const packed_block_size = 8; // Number of bytes used to store a single block of 16 FP4 values (2 values per byte)
 
+const PackedVector = @Vector(packed_block_size, u8); // Stores the packed FP4 values (8 bytes) for a single block of 16 values
+const CodeVector = @Vector(block_size, u8); // Encoded FP4 values (4 bits each) stored in a u8 vector
+const FloatVector = @Vector(block_size, f32); // Stores the decoded E2M1 values
+const F16Vector = @Vector(block_size, f16); // Stores the output
+
 const e2m1_values = [_]f32{
     0.0, 0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
     0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
@@ -17,7 +22,37 @@ pub fn decodeE2M1(code: u4) f32 {
     return e2m1_values[code];
 }
 
-pub fn decodeE4M3(bits: u8) f32 {
+fn decodeE2M1Vector(codes: CodeVector) FloatVector { // Requires decoding values instead of looking up in a table, to allow for SIMD optimization
+    const exponent = (codes >> @as(CodeVector, @splat(1))) & @as(CodeVector, @splat(0x03));
+    const mantissa = codes & @as(CodeVector, @splat(0x01));
+    const is_negative = (codes & @as(CodeVector, @splat(0x08))) != @as(CodeVector, @splat(0));
+
+    const mantissa_float: FloatVector = @floatFromInt(mantissa);
+
+    // Decode directly from the E2M1 representation.
+    const zero: FloatVector = @splat(0.0);
+    const half: FloatVector = @splat(0.5);
+    const one: FloatVector = @splat(1.0);
+
+    const is_subnormal = exponent == @as(CodeVector, @splat(0));
+
+    // E2M1 bias = 1. For normal values, 2^(exponent - 1) is 1, 2 or 4.
+    var exponent_scale: FloatVector = one;
+    exponent_scale = @select(f32, exponent == @as(CodeVector, @splat(2)), @as(FloatVector, @splat(2.0)), exponent_scale);
+    exponent_scale = @select(f32, exponent == @as(CodeVector, @splat(3)), @as(FloatVector, @splat(4.0)), exponent_scale);
+
+    const subnormal = mantissa_float * half;
+    const significand = one + mantissa_float * half;
+    const normal = significand * exponent_scale;
+
+    var value = @select(f32, is_subnormal, subnormal, normal);
+    value = @select(f32, is_negative, -value, value);
+    value = @select(f32, value == zero, zero, value); // Both E2M1 zero encodings map to +0.0.
+
+    return value;
+}
+
+pub fn decodeE4M3(bits: u8) f32 { // Isn't vectorized because each block contains only one scale. If it becomes the bottleneck a possible optimization would be using a LUT.
     // Decodes a byte in the format s eeee mmm
     // (-1)^S * 2^(E-bias) * (1 + M/8) for E <> 0
     // (-1)^S * 2^(1-bias) * (M / 8) for E == 0
@@ -66,6 +101,35 @@ pub fn dequantizeBlockF16(
     }
 }
 
+pub fn dequantizeBlockF16Simd(
+    packed_bytes: *const [8]u8,
+    block_scale_bits: u8,
+    global_scale: f32,
+    out: *[16]f16,
+) void {
+    // Dequantizes an entire block by decoding its scale, and then unpacking and dequantizing all the 16 values inside it (using SIMD).
+    const local_scale = decodeE4M3(block_scale_bits) * global_scale; //TODO: maybe implement vectorized decodeE4M3
+    const bytes: PackedVector = packed_bytes.*;
+
+    const low = bytes & @as(PackedVector, @splat(0x0f));
+    const high = bytes >> @as(PackedVector, @splat(4));
+    const codes: CodeVector = @shuffle(u8, low, high, @Vector(16, i32){
+        0, ~@as(i32, 0), // ~ corresponds to elements in "high"
+        1, ~@as(i32, 1),
+        2, ~@as(i32, 2),
+        3, ~@as(i32, 3),
+        4, ~@as(i32, 4),
+        5, ~@as(i32, 5),
+        6, ~@as(i32, 6),
+        7, ~@as(i32, 7),
+    });
+    const decoded = decodeE2M1Vector(codes);
+    const scale: FloatVector = @splat(local_scale);
+    const scaled = decoded * scale;
+    const result: F16Vector = @floatCast(scaled);
+    out.* = result;
+}
+
 pub fn dequantizeBlocksF16(
     packed_bytes: []const u8,
     scales: []const u8,
@@ -87,9 +151,14 @@ pub fn dequantizeBlocksF16(
     for (0..num_blocks) |block_index| {
         const packed_block = packed_bytes[block_index * packed_block_size .. (block_index + 1) * packed_block_size];
         const block_scale_bits = scales[block_index];
-        var dequantized_block: [16]f16 = undefined;
-        dequantizeBlockF16(packed_block[0..packed_block_size], block_scale_bits, global_scale, &dequantized_block);
-        std.mem.copyForwards(f16, output[block_index * block_size .. (block_index + 1) * block_size], &dequantized_block);
+        //var dequantized_block: [16]f16 = undefined;
+        //dequantizeBlockF16(packed_block[0..packed_block_size], block_scale_bits, global_scale, &dequantized_block);
+        const output_start = block_index * block_size;
+        const output_block: *[block_size]f16 = output[output_start..][0..block_size]; // Creates a window for the current block
+
+        dequantizeBlockF16Simd(packed_block[0..packed_block_size], block_scale_bits, global_scale, output_block);
+        // dequantizeBlockF16Simd(packed_block[0..packed_block_size], block_scale_bits, global_scale, &dequantized_block);
+        // std.mem.copyForwards(f16, output[block_index * block_size .. (block_index + 1) * block_size], &dequantized_block);
     }
 }
 
