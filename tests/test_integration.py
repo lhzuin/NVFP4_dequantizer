@@ -239,6 +239,8 @@ def main() -> None:
             str(BIN),
             str(large_input),
             str(large_output),
+            "--threads",
+            "4",
         )
 
         validate_chunk_boundary_output(large_output, blocks=4097)

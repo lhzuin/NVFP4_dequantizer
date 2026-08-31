@@ -2,3 +2,5 @@
 zig-out/
 *.o
 */__pycache__/
+*.zip
+*.safetensors

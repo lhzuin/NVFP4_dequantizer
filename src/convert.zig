@@ -36,6 +36,9 @@ pub fn dequantizeFile(
     output_path: []const u8,
     options: Options,
 ) !void {
+    if (options.threads == 0) return error.InvalidThreadCount;
+    if (options.chunk_blocks == 0) return error.InvalidChunkSize;
+
     // 1. Open input
     var file = try std.Io.Dir.cwd().openFile(io, input_path, .{ .mode = .read_only });
     defer file.close(io);
@@ -79,7 +82,7 @@ pub fn dequantizeFile(
     try output_header.write(allocator, writer);
 
     // 8. Execute ConversionPlan
-    plan.executePlan(&file_r, writer, options) catch |err| {
+    plan.executePlan(io, &file_r, writer, options) catch |err| {
         std.debug.print("Error during conversion: {}\n", .{err});
         return err;
     };
@@ -192,6 +195,7 @@ const ConversionPlan = struct {
 
     pub fn executePlan(
         self: *ConversionPlan,
+        io: std.Io,
         file_r: *std.Io.File.Reader,
         writer: *std.Io.Writer,
         options: Options,
@@ -204,8 +208,7 @@ const ConversionPlan = struct {
                 },
 
                 .nvfp4 => |source| {
-                    // TODO: Here I should probably pass the source, and use it to find the scales (specially because it contains the offsets from the input file, which is important for the reader)
-                    try convertQuantizedWeightF16(self.allocator, source, &tensor.info, file_r, writer, self.input_header.data_start, options.chunk_blocks);
+                    try convertQuantizedWeightF16(self.allocator, io, source, &tensor.info, file_r, writer, self.input_header.data_start, options);
                 },
             }
         }
@@ -251,7 +254,7 @@ const ChunkScratch = struct {
 const ChunkJob = struct {
     // Represents a job for processing a chunk of blocks. It contains the necessary information to read the packed bytes and scales from the input file, dequantize them, and write the dequantized values to the output writer.
     sequence: usize, // Index of the chunk in the sequence of chunks to be processed. Later used to restore output order when chunks are processed in parallel.
-
+    // Obs: more fine-grained multi-thread approach was chosen instead to limit memory usage and avoid IO collisions.
     weight_offset: u64,
     scale_offset: u64,
     output_offset: u64,
@@ -259,28 +262,20 @@ const ChunkJob = struct {
     block_count: usize, // Actual number of blocks to process in this chunk (may be less than the chunk size for the last chunk).
 };
 
-fn convertQuantizedWeightF16(allocator: std.mem.Allocator, source: Nvfp4Source, output_info: *const st.TensorInfo, reader: *std.Io.File.Reader, writer: *std.Io.Writer, input_data_start: u64, chunk_blocks: usize) !void {
+fn convertQuantizedWeightF16(allocator: std.mem.Allocator, io: std.Io, source: Nvfp4Source, output_info: *const st.TensorInfo, reader: *std.Io.File.Reader, writer: *std.Io.Writer, input_data_start: u64, options: Options) !void {
     // Dequantizes a quantized weight tensor from the input file and writes the dequantized values to the output file.
-    if (chunk_blocks == 0) return error.InvalidChunkSize;
+
+    const chunk_blocks = options.chunk_blocks;
     const num_bytes = source.weight.byteSize();
     if (num_bytes % nvfp4.packed_block_size != 0) return error.InvalidNvfp4WeightSize;
 
     const num_blocks_u64 = num_bytes / nvfp4.packed_block_size;
     if (source.block_scale.byteSize() != num_blocks_u64) return error.InvalidBlockScaleCount;
 
-    const num_blocks = std.math.cast(usize, num_blocks_u64) orelse return error.TensorTooLarge; // Maybe move these validations to a plan/validation step inside ChunkScratch
-    // const buffer = try allocator.alloc(u8, @intCast(num_bytes));
-    // defer allocator.free(buffer);
-    // try reader.seekTo(source.weight.begin + input_data_start);
-    // try reader.interface.readSliceAll(buffer);
+    const num_blocks = std.math.cast(usize, num_blocks_u64) orelse return error.TensorTooLarge;
 
     // Find the scale and scale2 tensors
-    // const block_scale_tensor = source.block_scale;
     const global_scale_tensor = source.global_scale; // As global scale is a single value, we can read it once and reuse it for all blocks.
-    // const block_scale_bytes = try allocator.alloc(u8, block_scale_tensor.byteSize());
-    // defer allocator.free(block_scale_bytes);
-    // try reader.seekTo(block_scale_tensor.begin + input_data_start);
-    // try reader.interface.readSliceAll(block_scale_bytes);
 
     if (global_scale_tensor.byteSize() != 4)
         return error.InvalidGlobalScale;
@@ -299,7 +294,7 @@ fn convertQuantizedWeightF16(allocator: std.mem.Allocator, source: Nvfp4Source, 
     var first_block: usize = 0;
     var sequence: usize = 0;
 
-    while (first_block < num_blocks) { // iterates sequentially through jobs (futurally this will be parallelized)
+    while (first_block < num_blocks) {
         const block_count = @min(chunk_blocks, num_blocks - first_block); // How many blocks to process in this chunk
 
         const first_block_u64: u64 = @intCast(first_block); // Position of first block in the chunk
@@ -327,22 +322,25 @@ fn convertQuantizedWeightF16(allocator: std.mem.Allocator, source: Nvfp4Source, 
         try reader.seekTo(job.scale_offset);
         try reader.interface.readSliceAll(scale_chunk);
 
-        // Dequantize the chunk of blocks
-        try nvfp4.dequantizeBlocksF16(weight_chunk, scale_chunk, global_scale, output_chunk);
+        // Dequantize the chunk of blocks (with multicore)
+        try dequantizeChunkParallel(
+            io,
+            weight_chunk,
+            scale_chunk,
+            global_scale,
+            output_chunk,
+            options.threads,
+        );
+
+        //try nvfp4.dequantizeBlocksF16(weight_chunk, scale_chunk, global_scale, output_chunk);
 
         // Write the dequantized values to the output writer
-        //try writer.seekTo(job.output_offset); // Not necessary if the writer is sequential, but added for clarity and safety //This line is currently bugged and was removed to make the code compile
         try writer.writeAll(std.mem.sliceAsBytes(output_chunk));
 
         // Increase counters for the next job/chunk
         first_block += block_count;
         sequence += 1;
     }
-
-    // const num_values = num_bytes * 2; // Each byte contains 2 values
-    // var weights_reader = std.Io.Reader.fixed(buffer);
-    // var scales_reader = std.Io.Reader.fixed(block_scale_bytes);
-    // try nvfp4.dequantizeStreamF16(&weights_reader, &scales_reader, global_scale, writer, num_values);
 }
 
 fn copyTensorOld(allocator: std.mem.Allocator, source: *const st.TensorInfo, reader: *std.Io.File.Reader, writer: *std.Io.Writer, input_data_start: u64) !void {
@@ -373,42 +371,6 @@ fn countOutputTensors(header: *const st.Header) usize {
         }
     }
     return count;
-}
-
-fn isNvfp4Weight(
-    allocator: std.mem.Allocator,
-    header: *const st.Header,
-    tensor: *const st.TensorInfo,
-) bool { // TODO: delete this function
-
-    // Checks that:
-    // 1- tensor tensor.dtype == u8,
-    // 2- tensor.name ends with ".weight"
-    // 3- the corresponding scale and scale2 tensors exist in the header,
-    // 4- block scale dtype == F8_E4M3
-    // 5- global scale dtype == F32
-    if (tensor.dtype != .u8) return false;
-    if (!std.mem.endsWith(u8, tensor.name, ".weight")) return false;
-    const block_scale_name =
-        try std.fmt.allocPrint(
-            allocator,
-            "{s}_scale",
-            .{tensor.name},
-        );
-    defer allocator.free(block_scale_name);
-
-    const global_scale_name =
-        try std.fmt.allocPrint(
-            allocator,
-            "{s}_scale_2",
-            .{tensor.name},
-        );
-    defer allocator.free(global_scale_name);
-    const block_scale_tensor = header.find(block_scale_name) orelse return false;
-    const global_scale_tensor = header.find(global_scale_name) orelse return false;
-    if (block_scale_tensor.dtype != .f8_e4m3) return false;
-    if (global_scale_tensor.dtype != .f32) return false;
-    return true;
 }
 
 fn isNvfp4Scale(
@@ -458,4 +420,75 @@ fn matchNvfp4Weight(
         .block_scale = block_scale_tensor,
         .global_scale = global_scale_tensor,
     };
+}
+
+fn dequantizeBlocksWorker(
+    packed_bytes: []const u8,
+    scales: []const u8,
+    global_scale: f32,
+    output: []f16,
+) void {
+    // Wrapper to nvfp4's dequantization function. Needed because Io.Group.concurrent requires callbacks returning void or only error.Canceled
+    nvfp4.dequantizeBlocksF16(packed_bytes, scales, global_scale, output) catch unreachable;
+}
+
+fn dequantizeChunkParallel(
+    io: std.Io,
+    packed_bytes: []const u8,
+    scales: []const u8,
+    global_scale: f32,
+    output: []f16,
+    threads: usize,
+) !void {
+    if (packed_bytes.len % nvfp4.packed_block_size != 0) {
+        return error.InvalidPackedLength;
+    }
+
+    const num_blocks = packed_bytes.len / nvfp4.packed_block_size;
+
+    if (scales.len != num_blocks) {
+        return error.ScaleCountMismatch;
+    }
+
+    if (output.len != num_blocks * nvfp4.block_size) {
+        return error.OutputLengthMismatch;
+    }
+
+    if (threads == 1 or num_blocks <= 1) {
+        return nvfp4.dequantizeBlocksF16(
+            packed_bytes,
+            scales,
+            global_scale,
+            output,
+        );
+    }
+
+    const worker_count = @min(threads, num_blocks);
+
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+
+    for (0..worker_count) |worker_index| {
+        const first_block = worker_index * num_blocks / worker_count;
+        const end_block = (worker_index + 1) * num_blocks / worker_count;
+
+        const packed_part = packed_bytes[first_block * nvfp4.packed_block_size .. end_block * nvfp4.packed_block_size];
+
+        const scale_part = scales[first_block..end_block];
+
+        const output_part = output[first_block * nvfp4.block_size .. end_block * nvfp4.block_size];
+
+        try group.concurrent(
+            io,
+            dequantizeBlocksWorker,
+            .{
+                packed_part,
+                scale_part,
+                global_scale,
+                output_part,
+            },
+        );
+    }
+
+    try group.await(io);
 }

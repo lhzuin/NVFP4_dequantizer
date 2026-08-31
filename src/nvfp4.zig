@@ -151,14 +151,11 @@ pub fn dequantizeBlocksF16(
     for (0..num_blocks) |block_index| {
         const packed_block = packed_bytes[block_index * packed_block_size .. (block_index + 1) * packed_block_size];
         const block_scale_bits = scales[block_index];
-        //var dequantized_block: [16]f16 = undefined;
-        //dequantizeBlockF16(packed_block[0..packed_block_size], block_scale_bits, global_scale, &dequantized_block);
+
         const output_start = block_index * block_size;
         const output_block: *[block_size]f16 = output[output_start..][0..block_size]; // Creates a window for the current block
 
         dequantizeBlockF16Simd(packed_block[0..packed_block_size], block_scale_bits, global_scale, output_block);
-        // dequantizeBlockF16Simd(packed_block[0..packed_block_size], block_scale_bits, global_scale, &dequantized_block);
-        // std.mem.copyForwards(f16, output[block_index * block_size .. (block_index + 1) * block_size], &dequantized_block);
     }
 }
 
