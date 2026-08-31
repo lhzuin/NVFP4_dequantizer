@@ -52,19 +52,22 @@ zig build -Doptimize=ReleaseFast
 ## Usage
 
 ```sh
-./zig-out/bin/nvfp4-dequant INPUT OUTPUT [--threads N]
+./zig-out/bin/nvfp4-dequant INPUT OUTPUT \
+    [--output-format FORMAT] [--threads N] [--chunk-blocks N]
 ```
 
 For example:
 
 ```sh
-./zig-out/bin/nvfp4-dequant model_nvfp4.safetensors model_f16.safetensors --threads 8
+./zig-out/bin/nvfp4-dequant model_nvfp4.safetensors model_f16.safetensors \
+    --output-format f16 --threads 8 --chunk-blocks 4096
 ```
 
-`N` must be greater than zero and defaults to `1`. The executable can also be built and run in one command:
+`--output-format` defaults to `f16`, which is currently the only supported output format. The numeric options must be greater than zero: `--threads` defaults to `1`, while `--chunk-blocks` defaults to `4096` and controls the maximum number of NVFP4 blocks held in each processing chunk. The executable can also be built and run in one command:
 
 ```sh
-zig build run -- model_nvfp4.safetensors model_f16.safetensors --threads 8
+zig build run -- model_nvfp4.safetensors model_f16.safetensors \
+    --output-format f16 --threads 8 --chunk-blocks 4096
 ```
 
 ## Design

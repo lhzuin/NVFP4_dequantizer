@@ -99,7 +99,6 @@ pub const Header = struct {
         reader: *std.Io.Reader,
     ) !Header {
         // Reads header for the .safetensors file and creates the Header object
-        //TODO: fix this function to use the updated Zig JSON API
 
         // Create arena for allocating metadata
         var arena = std.heap.ArenaAllocator.init(allocator);

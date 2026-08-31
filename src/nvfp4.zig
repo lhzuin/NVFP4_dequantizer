@@ -1,5 +1,5 @@
 // Implements the nvfp4 specific logic, by receiving the packed bytes and scales and returning the values in the desired precision
-// Will include SIMD logic as a future improvement
+// Includes SIMD vectorized implementations for dequantization
 // Includes pure numeric transformations and leaves the IO for convert.zig
 
 const std = @import("std");
@@ -108,7 +108,7 @@ pub fn dequantizeBlockF16Simd(
     out: *[16]f16,
 ) void {
     // Dequantizes an entire block by decoding its scale, and then unpacking and dequantizing all the 16 values inside it (using SIMD).
-    const local_scale = decodeE4M3(block_scale_bits) * global_scale; //TODO: maybe implement vectorized decodeE4M3
+    const local_scale = decodeE4M3(block_scale_bits) * global_scale;
     const bytes: PackedVector = packed_bytes.*;
 
     const low = bytes & @as(PackedVector, @splat(0x0f));
@@ -156,39 +156,5 @@ pub fn dequantizeBlocksF16(
         const output_block: *[block_size]f16 = output[output_start..][0..block_size]; // Creates a window for the current block
 
         dequantizeBlockF16Simd(packed_block[0..packed_block_size], block_scale_bits, global_scale, output_block);
-    }
-}
-
-pub fn dequantizeStreamF16( // Deprecated: Use dequantizeBlocksF16 instead, which is more flexible and avoids unnecessary IO.
-    weights: *std.Io.Reader,
-    scales: *std.Io.Reader,
-    global_scale: f32,
-    writer: *std.Io.Writer,
-    num_values: usize,
-) !void {
-    // Dequantizes the entire stream of weights, reading the packed bytes and scales, and writing the dequantized values to the output writer.
-    if (num_values == 0) {
-        return error.EmptyStream;
-    }
-    if (num_values % block_size != 0) {
-        return error.InvalidBlockCount;
-    }
-    const num_blocks = num_values / block_size;
-    for (0..num_blocks) |_| {
-        // Read 8 weight bytes
-        var packed_block: [8]u8 = undefined;
-        try weights.readSliceAll(&packed_block);
-
-        // Read 1 scale byte
-        var block_scale_bits: [1]u8 = undefined;
-        try scales.readSliceAll(&block_scale_bits);
-
-        // Dequantize block
-        var dequantized_block: [16]f16 = undefined;
-        dequantizeBlockF16(&packed_block, block_scale_bits[0], global_scale, &dequantized_block);
-
-        // Write dequantized block
-        const write_bits = std.mem.asBytes(&dequantized_block);
-        try writer.writeAll(write_bits);
     }
 }

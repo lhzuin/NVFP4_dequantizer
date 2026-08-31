@@ -1,5 +1,5 @@
 // Orchestrates the entire conversion pipeline.
-// Will support parallel scheduling as a future improvement
+// Supports multi-threading parallelism and bounded-memory processing
 // Assumes common Nvidia ModelOpt format with foo.weight, foo.weight_scale, foo.weight_scale_2
 
 const std = @import("std");
@@ -203,7 +203,6 @@ const ConversionPlan = struct {
         for (self.tensors) |tensor| {
             switch (tensor.source) {
                 .copy => |source| {
-                    //try copyTensor(self.allocator, source, file_r, writer, self.input_header.data_start);
                     try copyTensor(source, file_r, writer, self.input_header.data_start);
                 },
 
@@ -332,8 +331,6 @@ fn convertQuantizedWeightF16(allocator: std.mem.Allocator, io: std.Io, source: N
             options.threads,
         );
 
-        //try nvfp4.dequantizeBlocksF16(weight_chunk, scale_chunk, global_scale, output_chunk);
-
         // Write the dequantized values to the output writer
         try writer.writeAll(std.mem.sliceAsBytes(output_chunk));
 
@@ -341,17 +338,6 @@ fn convertQuantizedWeightF16(allocator: std.mem.Allocator, io: std.Io, source: N
         first_block += block_count;
         sequence += 1;
     }
-}
-
-fn copyTensorOld(allocator: std.mem.Allocator, source: *const st.TensorInfo, reader: *std.Io.File.Reader, writer: *std.Io.Writer, input_data_start: u64) !void {
-    // Copies the bytes of an input tensor to the output file. This is used for tensors that do not require dequantization, such as biases.
-
-    const num_bytes = source.byteSize();
-    const buffer = try allocator.alloc(u8, @intCast(num_bytes));
-    defer allocator.free(buffer);
-    try reader.seekTo(source.begin + input_data_start);
-    try reader.interface.readSliceAll(buffer);
-    try writer.writeAll(buffer);
 }
 
 fn copyTensor(source: *const st.TensorInfo, reader: *std.Io.File.Reader, writer: *std.Io.Writer, input_data_start: u64) !void {
@@ -440,6 +426,7 @@ fn dequantizeChunkParallel(
     output: []f16,
     threads: usize,
 ) !void {
+    // Wrapper that implements multi-threading parallelism inside a chunk for dequantizing weights
     if (packed_bytes.len % nvfp4.packed_block_size != 0) {
         return error.InvalidPackedLength;
     }

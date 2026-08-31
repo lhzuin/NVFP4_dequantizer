@@ -5,7 +5,7 @@ const convert = @import("convert.zig");
 
 fn printUsage(program: []const u8) void {
     std.debug.print(
-        "Usage: {s} INPUT OUTPUT [--threads N]\n",
+        "Usage: {s} INPUT OUTPUT [--output-format FORMAT] [--threads N] [--chunk-blocks N]\n",
         .{program},
     );
 }
@@ -29,7 +29,20 @@ pub fn main(init: std.process.Init) !void {
 
     var i: usize = 3;
     while (i < args.len) {
-        if (std.mem.eql(u8, args[i], "--threads")) {
+        if (std.mem.eql(u8, args[i], "--output-format")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("Missing value after --output-format\n", .{});
+                printUsage(args[0]);
+                return;
+            }
+
+            options.output_type = std.meta.stringToEnum(convert.OutputType, args[i + 1]) orelse {
+                std.debug.print("Unsupported output format: {s} (supported: f16)\n", .{args[i + 1]});
+                return;
+            };
+
+            i += 2;
+        } else if (std.mem.eql(u8, args[i], "--threads")) {
             if (i + 1 >= args.len) {
                 std.debug.print("Missing value after --threads\n", .{});
                 printUsage(args[0]);
@@ -43,6 +56,24 @@ pub fn main(init: std.process.Init) !void {
 
             if (options.threads == 0) {
                 std.debug.print("Thread count must be greater than zero\n", .{});
+                return;
+            }
+
+            i += 2;
+        } else if (std.mem.eql(u8, args[i], "--chunk-blocks")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("Missing value after --chunk-blocks\n", .{});
+                printUsage(args[0]);
+                return;
+            }
+
+            options.chunk_blocks = std.fmt.parseInt(usize, args[i + 1], 10) catch {
+                std.debug.print("Invalid chunk block count: {s}\n", .{args[i + 1]});
+                return;
+            };
+
+            if (options.chunk_blocks == 0) {
+                std.debug.print("Chunk block count must be greater than zero\n", .{});
                 return;
             }
 
