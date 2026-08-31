@@ -467,65 +467,6 @@ test "chunk kernel accepts empty input" {
     try nvfp4.dequantizeBlocksF16(&encoded, &scales, 1.0, &output);
 }
 
-test "stream kernel writes a dequantized block" {
-    const encoded = [_]u8{
-        0x10, 0x32, 0x54, 0x76,
-        0x98, 0xba, 0xdc, 0xfe,
-    };
-    const scales = [_]u8{0x38};
-    var weights_reader = std.Io.Reader.fixed(&encoded);
-    var scales_reader = std.Io.Reader.fixed(&scales);
-    var output: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer output.deinit();
-
-    try nvfp4.dequantizeStreamF16(
-        &weights_reader,
-        &scales_reader,
-        1.0,
-        &output.writer,
-        nvfp4.block_size,
-    );
-
-    const expected = [_]f16{
-        0.0,  0.5,  1.0,  1.5,
-        2.0,  3.0,  4.0,  6.0,
-        0.0,  -0.5, -1.0, -1.5,
-        -2.0, -3.0, -4.0, -6.0,
-    };
-    try testing.expectEqualSlices(u8, std.mem.asBytes(&expected), output.written());
-}
-
-test "stream kernel validates value count and short input" {
-    var empty_weights = std.Io.Reader.fixed(&.{});
-    var empty_scales = std.Io.Reader.fixed(&.{});
-    var output: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer output.deinit();
-
-    try testing.expectError(
-        error.EmptyStream,
-        nvfp4.dequantizeStreamF16(&empty_weights, &empty_scales, 1.0, &output.writer, 0),
-    );
-    try testing.expectError(
-        error.InvalidBlockCount,
-        nvfp4.dequantizeStreamF16(&empty_weights, &empty_scales, 1.0, &output.writer, 15),
-    );
-
-    const short_encoded = [_]u8{0} ** (nvfp4.packed_block_size - 1);
-    const one_scale = [_]u8{0x38};
-    var short_weights = std.Io.Reader.fixed(&short_encoded);
-    var one_scale_reader = std.Io.Reader.fixed(&one_scale);
-    try testing.expectError(
-        error.EndOfStream,
-        nvfp4.dequantizeStreamF16(
-            &short_weights,
-            &one_scale_reader,
-            1.0,
-            &output.writer,
-            nvfp4.block_size,
-        ),
-    );
-}
-
 test "SafeTensors parser ignores metadata and supports BF16" {
     const json =
         "{\"__metadata__\":{\"format\":\"pt\"},\"tensor\":{\"dtype\":\"BF16\",\"shape\":[2],\"data_offsets\":[0,4]}}";

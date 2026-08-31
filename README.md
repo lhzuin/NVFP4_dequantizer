@@ -99,7 +99,7 @@ Multithreading is performed within each chunk. The main thread reads a chunk onc
 │   ├── nvfp4.zig                     Scalar and SIMD NVFP4 kernels
 │   └── safetensors.zig               SafeTensors header reader and writer
 ├── tests/
-│   ├── tests.zig                     Codec, SIMD, stream, and header tests
+│   ├── tests.zig                     Codec, SIMD, chunk, and header tests
 │   ├── convert_tests.zig             File conversion and determinism tests
 │   ├── test_integration.py           End-to-end CLI tests
 │   └── fixtures/                     Small known-good SafeTensors fixtures

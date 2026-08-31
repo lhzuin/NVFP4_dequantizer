@@ -21,76 +21,6 @@ pub const OutputType = enum {
     }
 };
 
-pub const Options = struct {
-    output_type: OutputType = .f16,
-
-    // Used later:
-    threads: usize = 1,
-    chunk_blocks: usize = 4096, // Each chunk will contain this many blocks of 16 values each (except the last one that might be smaller). This is used for parallelization and memory management.
-};
-
-pub fn dequantizeFile(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    input_path: []const u8,
-    output_path: []const u8,
-    options: Options,
-) !void {
-    if (options.threads == 0) return error.InvalidThreadCount;
-    if (options.chunk_blocks == 0) return error.InvalidChunkSize;
-
-    // 1. Open input
-    var file = try std.Io.Dir.cwd().openFile(io, input_path, .{ .mode = .read_only });
-    defer file.close(io);
-    var buffer: [1024]u8 = undefined;
-    var file_r: std.Io.File.Reader = file.reader(io, &buffer);
-
-    // 2. Parse input header
-    var header = try st.Header.parse(allocator, &file_r.interface);
-    defer header.deinit();
-
-    // 3. Build ConversionPlan
-    var plan = try ConversionPlan.buildPlan(allocator, &header, options.output_type);
-    defer plan.deinit();
-
-    // 4. Create output file
-
-    var output_file = try std.Io.Dir.cwd().createFile(
-        io,
-        output_path,
-        .{},
-    );
-    defer output_file.close(io);
-
-    // 5. Create output Writer
-    var output_buffer: [4096]u8 = undefined;
-    var output_file_writer = output_file.writer(io, &output_buffer);
-
-    const writer: *std.Io.Writer = &output_file_writer.interface;
-
-    // 6. Create new header for output file
-    const output_infos = try allocator.alloc(st.TensorInfo, plan.tensors.len);
-    defer allocator.free(output_infos);
-
-    for (plan.tensors, 0..) |tensor, i| {
-        output_infos[i] = tensor.info;
-    } // Needed because the plan.tensors array contains OutputTensor objects (not accessible by safetensors.zig's Header)
-    var output_header = try st.Header.fromInfos(allocator, output_infos);
-    defer output_header.deinit();
-
-    // 7. Write output SafeTensors header
-    try output_header.write(allocator, writer);
-
-    // 8. Execute ConversionPlan
-    plan.executePlan(io, &file_r, writer, options) catch |err| {
-        std.debug.print("Error during conversion: {}\n", .{err});
-        return err;
-    };
-
-    // 9. Flush output Writer
-    try writer.flush();
-}
-
 const OutputTensor = struct {
     // Saves the intended structure of an output tensor so that we can easily process it later.
 
@@ -252,7 +182,7 @@ const ChunkScratch = struct {
 
 const ChunkJob = struct {
     // Represents a job for processing a chunk of blocks. It contains the necessary information to read the packed bytes and scales from the input file, dequantize them, and write the dequantized values to the output writer.
-    sequence: usize, // Index of the chunk in the sequence of chunks to be processed. Later used to restore output order when chunks are processed in parallel.
+    sequence: usize, // Index of the chunk in the sequence of chunks to be processed.
     // Obs: more fine-grained multi-thread approach was chosen instead to limit memory usage and avoid IO collisions.
     weight_offset: u64,
     scale_offset: u64,
@@ -260,6 +190,75 @@ const ChunkJob = struct {
 
     block_count: usize, // Actual number of blocks to process in this chunk (may be less than the chunk size for the last chunk).
 };
+
+pub const Options = struct {
+    output_type: OutputType = .f16,
+
+    threads: usize = 1,
+    chunk_blocks: usize = 4096, // Each chunk will contain this many blocks of 16 values each (except the last one that might be smaller). This is used for parallelization and memory management.
+};
+
+pub fn dequantizeFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    input_path: []const u8,
+    output_path: []const u8,
+    options: Options,
+) !void {
+    if (options.threads == 0) return error.InvalidThreadCount;
+    if (options.chunk_blocks == 0) return error.InvalidChunkSize;
+
+    // 1. Open input
+    var file = try std.Io.Dir.cwd().openFile(io, input_path, .{ .mode = .read_only });
+    defer file.close(io);
+    var buffer: [1024]u8 = undefined;
+    var file_r: std.Io.File.Reader = file.reader(io, &buffer);
+
+    // 2. Parse input header
+    var header = try st.Header.parse(allocator, &file_r.interface);
+    defer header.deinit();
+
+    // 3. Build ConversionPlan
+    var plan = try ConversionPlan.buildPlan(allocator, &header, options.output_type);
+    defer plan.deinit();
+
+    // 4. Create output file
+
+    var output_file = try std.Io.Dir.cwd().createFile(
+        io,
+        output_path,
+        .{},
+    );
+    defer output_file.close(io);
+
+    // 5. Create output Writer
+    var output_buffer: [4096]u8 = undefined;
+    var output_file_writer = output_file.writer(io, &output_buffer);
+
+    const writer: *std.Io.Writer = &output_file_writer.interface;
+
+    // 6. Create new header for output file
+    const output_infos = try allocator.alloc(st.TensorInfo, plan.tensors.len);
+    defer allocator.free(output_infos);
+
+    for (plan.tensors, 0..) |tensor, i| {
+        output_infos[i] = tensor.info;
+    } // Needed because the plan.tensors array contains OutputTensor objects (not accessible by safetensors.zig's Header)
+    var output_header = try st.Header.fromInfos(allocator, output_infos);
+    defer output_header.deinit();
+
+    // 7. Write output SafeTensors header
+    try output_header.write(allocator, writer);
+
+    // 8. Execute ConversionPlan
+    plan.executePlan(io, &file_r, writer, options) catch |err| {
+        std.debug.print("Error during conversion: {}\n", .{err});
+        return err;
+    };
+
+    // 9. Flush output Writer
+    try writer.flush();
+}
 
 fn convertQuantizedWeightF16(allocator: std.mem.Allocator, io: std.Io, source: Nvfp4Source, output_info: *const st.TensorInfo, reader: *std.Io.File.Reader, writer: *std.Io.Writer, input_data_start: u64, options: Options) !void {
     // Dequantizes a quantized weight tensor from the input file and writes the dequantized values to the output file.
@@ -302,7 +301,7 @@ fn convertQuantizedWeightF16(allocator: std.mem.Allocator, io: std.Io, source: N
             .sequence = sequence,
             .weight_offset = input_data_start + source.weight.begin + first_block_u64 * nvfp4.packed_block_size,
             .scale_offset = input_data_start + source.block_scale.begin + first_block_u64,
-            .output_offset = output_info.begin + first_block_u64 * nvfp4.block_size * @sizeOf(f16), // Not sure if I should hardcode @sizeOf(f16) or centralize with the output type
+            .output_offset = output_info.begin + first_block_u64 * nvfp4.block_size * @sizeOf(f16),
             .block_count = block_count,
         };
 
@@ -363,8 +362,7 @@ fn isNvfp4Scale(
     tensor: *const st.TensorInfo,
 ) bool {
     // Detects if tensor.name ends with  weight_scale or weight_scale_2
-    return std.mem.endsWith(u8, tensor.name, ".weight_scale") or std.mem.endsWith(u8, tensor.name, ".weight_scale_2"); // Maybe centralize this naming logic somewhere
-
+    return std.mem.endsWith(u8, tensor.name, ".weight_scale") or std.mem.endsWith(u8, tensor.name, ".weight_scale_2");
 }
 
 fn matchNvfp4Weight(

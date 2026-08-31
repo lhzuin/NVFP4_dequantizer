@@ -1,4 +1,4 @@
-// Deals with CLI (path input, path output, output dtype) and calls convert.dequantizeFile(...)
+// Parses CLI options and invokes the SafeTensors conversion pipeline.
 
 const std = @import("std");
 const convert = @import("convert.zig");
