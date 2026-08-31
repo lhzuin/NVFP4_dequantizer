@@ -79,7 +79,7 @@ pub fn dequantizeFile(
     try output_header.write(allocator, writer);
 
     // 8. Execute ConversionPlan
-    plan.executePlan(&file_r, writer) catch |err| {
+    plan.executePlan(&file_r, writer, options) catch |err| {
         std.debug.print("Error during conversion: {}\n", .{err});
         return err;
     };
@@ -194,6 +194,7 @@ const ConversionPlan = struct {
         self: *ConversionPlan,
         file_r: *std.Io.File.Reader,
         writer: *std.Io.Writer,
+        options: Options,
     ) !void {
         for (self.tensors) |tensor| {
             switch (tensor.source) {
@@ -203,7 +204,7 @@ const ConversionPlan = struct {
 
                 .nvfp4 => |source| {
                     // TODO: Here I should probably pass the source, and use it to find the scales (specially because it contains the offsets from the input file, which is important for the reader)
-                    try convertQuantizedWeightF16(self.allocator, source, file_r, writer, self.input_header.data_start);
+                    try convertQuantizedWeightF16(self.allocator, source, &tensor.info, file_r, writer, self.input_header.data_start, options.chunk_blocks);
                 },
             }
         }
@@ -220,23 +221,19 @@ const ChunkScratch = struct {
         chunk_blocks: usize,
     ) !ChunkScratch {
         // Allocates scratch space for a chunk of blocks to be processed in parallel and returns a ChunkScratch object containing the allocated buffers.
+        const packed_bytes = try allocator.alloc(u8, chunk_blocks * nvfp4.packed_block_size);
+        errdefer allocator.free(packed_bytes);
+
+        const scales = try allocator.alloc(u8, chunk_blocks);
+        errdefer allocator.free(scales);
+
+        const output = try allocator.alloc(f16, chunk_blocks * nvfp4.block_size);
+        errdefer allocator.free(output);
+
         return .{
-            .packed_bytes = try allocator.alloc(
-                u8,
-                chunk_blocks *
-                    nvfp4.packed_block_size,
-            ),
-
-            .scales = try allocator.alloc(
-                u8,
-                chunk_blocks,
-            ),
-
-            .output = try allocator.alloc(
-                f16,
-                chunk_blocks *
-                    nvfp4.block_size,
-            ),
+            .packed_bytes = packed_bytes,
+            .scales = scales,
+            .output = output,
         };
     }
 
@@ -251,33 +248,38 @@ const ChunkScratch = struct {
 };
 
 const ChunkJob = struct {
-    // Represents a job for processing a chunk of blocks in parallel. It contains the necessary information to read the packed bytes and scales from the input file, dequantize them, and write the dequantized values to the output writer.
-    sequence: usize, //TODO: add description of this field
+    // Represents a job for processing a chunk of blocks. It contains the necessary information to read the packed bytes and scales from the input file, dequantize them, and write the dequantized values to the output writer.
+    sequence: usize, // Index of the chunk in the sequence of chunks to be processed. Later used to restore output order when chunks are processed in parallel.
 
     weight_offset: u64,
     scale_offset: u64,
     output_offset: u64,
 
-    block_count: usize, //TODO: add description of this field
+    block_count: usize, // Actual number of blocks to process in this chunk (may be less than the chunk size for the last chunk).
 };
 
-fn convertQuantizedWeightF16(allocator: std.mem.Allocator, source: Nvfp4Source, reader: *std.Io.File.Reader, writer: *std.Io.Writer, input_data_start: u64) !void {
+fn convertQuantizedWeightF16(allocator: std.mem.Allocator, source: Nvfp4Source, output_info: *const st.TensorInfo, reader: *std.Io.File.Reader, writer: *std.Io.Writer, input_data_start: u64, chunk_blocks: usize) !void {
     // Dequantizes a quantized weight tensor from the input file and writes the dequantized values to the output file.
+    if (chunk_blocks == 0) return error.InvalidChunkSize;
     const num_bytes = source.weight.byteSize();
     if (num_bytes % nvfp4.packed_block_size != 0) return error.InvalidNvfp4WeightSize;
-    const num_blocks = num_bytes / nvfp4.packed_block_size;
-    if (source.block_scale.byteSize() != num_blocks) return error.InvalidBlockScaleCount; // Maybe move these validations to a plan/validation step inside ChunkScratch
-    const buffer = try allocator.alloc(u8, @intCast(num_bytes));
-    defer allocator.free(buffer);
-    try reader.seekTo(source.weight.begin + input_data_start);
-    try reader.interface.readSliceAll(buffer);
+
+    const num_blocks_u64 = num_bytes / nvfp4.packed_block_size;
+    if (source.block_scale.byteSize() != num_blocks_u64) return error.InvalidBlockScaleCount;
+
+    const num_blocks = std.math.cast(usize, num_blocks_u64) orelse return error.TensorTooLarge; // Maybe move these validations to a plan/validation step inside ChunkScratch
+    // const buffer = try allocator.alloc(u8, @intCast(num_bytes));
+    // defer allocator.free(buffer);
+    // try reader.seekTo(source.weight.begin + input_data_start);
+    // try reader.interface.readSliceAll(buffer);
+
     // Find the scale and scale2 tensors
-    const block_scale_tensor = source.block_scale;
-    const global_scale_tensor = source.global_scale;
-    const block_scale_bytes = try allocator.alloc(u8, block_scale_tensor.byteSize());
-    defer allocator.free(block_scale_bytes);
-    try reader.seekTo(block_scale_tensor.begin + input_data_start);
-    try reader.interface.readSliceAll(block_scale_bytes);
+    // const block_scale_tensor = source.block_scale;
+    const global_scale_tensor = source.global_scale; // As global scale is a single value, we can read it once and reuse it for all blocks.
+    // const block_scale_bytes = try allocator.alloc(u8, block_scale_tensor.byteSize());
+    // defer allocator.free(block_scale_bytes);
+    // try reader.seekTo(block_scale_tensor.begin + input_data_start);
+    // try reader.interface.readSliceAll(block_scale_bytes);
 
     if (global_scale_tensor.byteSize() != 4)
         return error.InvalidGlobalScale;
@@ -289,10 +291,57 @@ fn convertQuantizedWeightF16(allocator: std.mem.Allocator, source: Nvfp4Source, 
     // Dequantize the weight tensor using the global scale and block scale tensors
     const global_scale_bits = std.mem.readInt(u32, &global_scale_bytes, .little);
     const global_scale: f32 = @bitCast(global_scale_bits);
-    const num_values = num_bytes * 2; // Each byte contains 2 values
-    var weights_reader = std.Io.Reader.fixed(buffer);
-    var scales_reader = std.Io.Reader.fixed(block_scale_bytes);
-    try nvfp4.dequantizeStreamF16(&weights_reader, &scales_reader, global_scale, writer, num_values);
+
+    var scratch = try ChunkScratch.init(allocator, chunk_blocks);
+    defer scratch.deinit(allocator);
+
+    var first_block: usize = 0;
+    var sequence: usize = 0;
+
+    while (first_block < num_blocks) { // iterates sequentially through jobs (futurally this will be parallelized)
+        const block_count = @min(chunk_blocks, num_blocks - first_block); // How many blocks to process in this chunk
+
+        const first_block_u64: u64 = @intCast(first_block); // Position of first block in the chunk
+
+        const job = ChunkJob{
+            .sequence = sequence,
+            .weight_offset = input_data_start + source.weight.begin + first_block_u64 * nvfp4.packed_block_size,
+            .scale_offset = input_data_start + source.block_scale.begin + first_block_u64,
+            .output_offset = output_info.begin + first_block_u64 * nvfp4.block_size * @sizeOf(f16), // Not sure if I should hardcode @sizeOf(f16) or centralize with the output type
+            .block_count = block_count,
+        };
+
+        // Create slices based on the scratch buffers and the job's block count (à la volée)
+        const weight_chunk_size = job.block_count * nvfp4.packed_block_size;
+        const output_value_count = job.block_count * nvfp4.block_size;
+
+        const weight_chunk = scratch.packed_bytes[0..weight_chunk_size];
+        const scale_chunk = scratch.scales[0..job.block_count];
+        const output_chunk = scratch.output[0..output_value_count];
+
+        // Set the reader to the correct positions for this job and read the weights and scales
+        try reader.seekTo(job.weight_offset);
+        try reader.interface.readSliceAll(weight_chunk);
+
+        try reader.seekTo(job.scale_offset);
+        try reader.interface.readSliceAll(scale_chunk);
+
+        // Dequantize the chunk of blocks
+        try nvfp4.dequantizeBlocksF16(weight_chunk, scale_chunk, global_scale, output_chunk);
+
+        // Write the dequantized values to the output writer
+        //try writer.seekTo(job.output_offset); // Not necessary if the writer is sequential, but added for clarity and safety //This line is currently bugged and was removed to make the code compile
+        try writer.writeAll(std.mem.sliceAsBytes(output_chunk));
+
+        // Increase counters for the next job/chunk
+        first_block += block_count;
+        sequence += 1;
+    }
+
+    // const num_values = num_bytes * 2; // Each byte contains 2 values
+    // var weights_reader = std.Io.Reader.fixed(buffer);
+    // var scales_reader = std.Io.Reader.fixed(block_scale_bytes);
+    // try nvfp4.dequantizeStreamF16(&weights_reader, &scales_reader, global_scale, writer, num_values);
 }
 
 fn copyTensor(allocator: std.mem.Allocator, source: *const st.TensorInfo, reader: *std.Io.File.Reader, writer: *std.Io.Writer, input_data_start: u64) !void {

@@ -1,10 +1,11 @@
 // Implements the nvfp4 specific logic, by receiving the packed bytes and scales and returning the values in the desired precision
 // Will include SIMD logic as a future improvement
+// Includes pure numeric transformations and leaves the IO for convert.zig
 
 const std = @import("std");
 
-pub const block_size = 16;
-pub const packed_block_size = 8;
+pub const block_size = 16; // Number of quantized FP4 values in a single block (8 bytes)
+pub const packed_block_size = 8; // Number of bytes used to store a single block of 16 FP4 values (2 values per byte)
 
 const e2m1_values = [_]f32{
     0.0, 0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
@@ -87,12 +88,12 @@ pub fn dequantizeBlocksF16(
         const packed_block = packed_bytes[block_index * packed_block_size .. (block_index + 1) * packed_block_size];
         const block_scale_bits = scales[block_index];
         var dequantized_block: [16]f16 = undefined;
-        dequantizeBlockF16(&packed_block, block_scale_bits, global_scale, &dequantized_block);
-        std.mem.copy(f16, output[block_index * block_size .. (block_index + 1) * block_size], dequantized_block);
+        dequantizeBlockF16(packed_block[0..packed_block_size], block_scale_bits, global_scale, &dequantized_block);
+        std.mem.copyForwards(f16, output[block_index * block_size .. (block_index + 1) * block_size], &dequantized_block);
     }
 }
 
-pub fn dequantizeStreamF16(
+pub fn dequantizeStreamF16( // Deprecated: Use dequantizeBlocksF16 instead, which is more flexible and avoids unnecessary IO.
     weights: *std.Io.Reader,
     scales: *std.Io.Reader,
     global_scale: f32,
